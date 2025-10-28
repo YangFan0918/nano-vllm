@@ -110,3 +110,22 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def max_speculative_tokens(self, seq: Sequence, draft_budget: int) -> int:
+        if draft_budget <= 0:
+            return 0
+
+        available = 0
+        free_blocks = len(self.free_block_ids)
+        seq_len = len(seq)
+
+        for _ in range(draft_budget):
+            seq_len += 1
+            if seq_len % self.block_size == 1:
+                if free_blocks == 0:
+                    break
+                free_blocks -= 1
+            available += 1
+
+        return available
+

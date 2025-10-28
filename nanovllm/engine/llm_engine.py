@@ -9,8 +9,8 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
-
+from nanovllm.engine.runner import ModelRunner, CpuDraftRunner
+from nanovllm.engine.speculative_executor import SpeculativeExecutor
 
 class LLMEngine:
 
@@ -31,6 +31,15 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.enable_speculative_sampling = config.enable_speculative_sampling
+        if self.enable_speculative_sampling:
+            self.cpu_draft_runner = CpuDraftRunner(config)
+            self.speculative_executor = SpeculativeExecutor(
+                self.model_runner,
+                self.cpu_draft_runner,
+                self.scheduler,
+                config,
+            )
         atexit.register(self.exit)
 
     def exit(self):
@@ -47,10 +56,31 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
+        committed = 0
+        already_postprocessed = False
+
+        if not is_prefill and self.enable_speculative_sampling and self.speculative_executor.can_step():
+            token_ids, committed, already_postprocessed = self.speculative_executor.step(seqs)
+        else:
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+
+        if not already_postprocessed:
+            self.scheduler.postprocess(seqs, token_ids)
+            if is_prefill:
+                for seq in seqs:
+                    cached = max(len(seq) - 1, 0)
+                    seq.num_cached_tokens = cached
+            else:
+                committed = len(token_ids) if token_ids is not None else len(seqs)
+                for seq in seqs:
+                    seq.num_cached_tokens = max(len(seq) - 1, 0)
+
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+
+        if is_prefill:
+            num_tokens = sum(len(seq) for seq in seqs)
+        else:
+            num_tokens = -committed if committed else -len(seqs)
         return outputs, num_tokens
 
     def is_finished(self):

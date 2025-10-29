@@ -1,5 +1,6 @@
+import logging
+from pathlib import Path
 from typing import List, Tuple
-
 import torch
 
 from nanovllm.config import Config
@@ -24,6 +25,19 @@ class SpeculativeExecutor:
         self.speculative_max_retries = config.speculative_max_retries
         self.draft_budget = config.draft_num_tokens
         self.block_manager = self.scheduler.block_manager
+        self.logger = logging.getLogger("nanovllm.speculative")
+        if not self.logger.handlers:
+            log_dir = Path("logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(log_dir / "speculative.log")
+            formatter = logging.Formatter(
+                fmt="%(asctime)s [%(levelname)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
 
     def can_step(self) -> bool:
         return self.failure_times <= self.speculative_max_retries
@@ -82,10 +96,17 @@ class SpeculativeExecutor:
 
         offset = 0
         any_reject = False
+        total_original_tokens = 0
+        total_truncated_tokens = 0
+        total_accepted_draft = 0
 
         for idx, seq in enumerate(seqs):
             draft_tokens = truncated_tokens[idx]
             draft_probs = truncated_probs[idx]
+            original_draft_len = len(draft_batches[idx])
+            truncated_len = len(draft_tokens)
+            total_original_tokens += original_draft_len
+            total_truncated_tokens += truncated_len
             temperature = max(seq.temperature, 1e-6)
             pref_len = len(draft_tokens) + 1
             seq_logits = logits[offset:offset + pref_len]
@@ -95,9 +116,11 @@ class SpeculativeExecutor:
             next_logits = seq_logits[-1]
 
             accepted_steps = 0
+            accepted_draft = 0
             rejected = False
             terminated = False
             base_completion = base_lengths[idx] - seq.num_prompt_tokens
+            produced_token = None
 
             for step_idx, token in enumerate(draft_tokens):
                 logits_step = verify_logits[step_idx] / temperature
@@ -111,6 +134,7 @@ class SpeculativeExecutor:
                 accept_prob = torch.clamp(token_prob_p / token_prob_q, max=1.0)
                 if torch.rand((), device=p.device) <= accept_prob:
                     accepted_steps += 1
+                    accepted_draft += 1
                     completion_tokens = base_completion + accepted_steps
                     if (not seq.ignore_eos and token == self.scheduler.eos) or completion_tokens >= seq.max_tokens:
                         keep_len = base_lengths[idx] + accepted_steps
@@ -132,6 +156,7 @@ class SpeculativeExecutor:
                 if seq.block_table:
                     self.block_manager.may_append(seq)
                 seq.append_token(new_token)
+                produced_token = new_token
                 accepted_steps += 1
                 rejected = True
                 any_reject = True
@@ -143,6 +168,20 @@ class SpeculativeExecutor:
                 if seq.block_table:
                     self.block_manager.may_append(seq)
                 seq.append_token(next_token)
+                produced_token = next_token
+
+            total_accepted_draft += accepted_draft
+            if self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(
+                    "seq=%d draft=%d truncated=%d accepted=%d rejected=%s terminated=%s new_token=%s",
+                    seq.seq_id,
+                    original_draft_len,
+                    truncated_len,
+                    accepted_draft,
+                    rejected,
+                    terminated,
+                    produced_token if produced_token is not None else "-",
+                )
 
         committed = 0
         for idx, seq in enumerate(seqs):
@@ -173,5 +212,16 @@ class SpeculativeExecutor:
             self.failure_times += 1
         else:
             self.failure_times = 0
+
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                "batch committed=%d original_draft=%d truncated=%d accepted=%d any_reject=%s failure_times=%d",
+                committed,
+                total_original_tokens,
+                total_truncated_tokens,
+                total_accepted_draft,
+                any_reject,
+                self.failure_times,
+            )
 
         return [], committed, True

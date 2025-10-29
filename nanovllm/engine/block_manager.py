@@ -111,6 +111,43 @@ class BlockManager:
         else:
             assert last_block.hash == -1
 
+    def rollback(self, seq: Sequence, target_len: int):
+        assert target_len >= seq.num_cached_tokens, "Cannot rollback cached prefix"
+        if target_len >= len(seq):
+            return
+
+        # Remove surplus tokens from the sequence buffer.
+        del seq.token_ids[target_len:]
+        seq.num_tokens = len(seq.token_ids)
+        if seq.token_ids:
+            seq.last_token = seq.token_ids[-1]
+
+        # Release unused KV blocks.
+        target_num_blocks = (target_len + self.block_size - 1) // self.block_size if target_len > 0 else 0
+        while len(seq.block_table) > target_num_blocks:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+        if not seq.block_table:
+            return
+
+        last_block_id = seq.block_table[-1]
+        last_block = self.blocks[last_block_id]
+        if target_len % self.block_size == 0:
+            if last_block.hash == -1:
+                token_ids = seq.block(len(seq.block_table) - 1)
+                prefix = self.blocks[seq.block_table[-2]].hash if len(seq.block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
+        else:
+            # Partial block cannot be cached.
+            last_block.hash = -1
+            last_block.token_ids = []
+
     def max_speculative_tokens(self, seq: Sequence, draft_budget: int) -> int:
         if draft_budget <= 0:
             return 0
@@ -128,4 +165,3 @@ class BlockManager:
             available += 1
 
         return available
-

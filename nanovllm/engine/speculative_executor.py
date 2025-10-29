@@ -5,7 +5,7 @@ import torch
 from nanovllm.config import Config
 from nanovllm.engine.runner import CpuDraftRunner, ModelRunner, RunnerOutput
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 
 
 class SpeculativeExecutor:
@@ -23,6 +23,7 @@ class SpeculativeExecutor:
         self.failure_times = 0
         self.speculative_max_retries = config.speculative_max_retries
         self.draft_budget = config.draft_num_tokens
+        self.block_manager = self.scheduler.block_manager
 
     def can_step(self) -> bool:
         return self.failure_times <= self.speculative_max_retries
@@ -33,158 +34,144 @@ class SpeculativeExecutor:
 
         cpu_output: RunnerOutput = self.cpu_model.run(seqs, False)
         assert cpu_output.token_ids is not None
-        draft_batches = cpu_output.token_ids
+        draft_batches = list(cpu_output.token_ids)
         assert len(draft_batches) == len(seqs)
-        draft_prob_batches = cpu_output.probs or [torch.empty((0, 0)) for _ in seqs]
-        if len(draft_prob_batches) < len(seqs):
-            draft_prob_batches = list(draft_prob_batches) + [torch.empty((0, 0)) for _ in range(len(seqs) - len(draft_prob_batches))]
 
-        block_manager = self.scheduler.block_manager
+        if cpu_output.probs is None:
+            draft_prob_batches = [torch.empty((0, 0)) for _ in seqs]
+        else:
+            draft_prob_batches = list(cpu_output.probs)
+            if len(draft_prob_batches) < len(seqs):
+                draft_prob_batches.extend(torch.empty((0, 0)) for _ in range(len(seqs) - len(draft_prob_batches)))
 
-        sequence_snapshots = []
-        for seq in seqs:
-            sequence_snapshots.append({
-                "token_ids": list(seq.token_ids),
-                "num_tokens": seq.num_tokens,
-                "last_token": seq.last_token,
-                "num_cached_tokens": seq.num_cached_tokens,
-                "block_table": list(seq.block_table),
-                "status": seq.status,
-            })
+        truncated_tokens: list[list[int]] = []
+        truncated_probs: list[torch.Tensor] = []
+        total_draft = 0
 
-        block_snapshot = dict(
-            free_block_ids=list(block_manager.free_block_ids),
-            used_block_ids=set(block_manager.used_block_ids),
-            hash_to_block_id=dict(block_manager.hash_to_block_id),
-            blocks=[(blk.ref_count, blk.hash, list(blk.token_ids)) for blk in block_manager.blocks],
-        )
+        for seq, tokens, probs in zip(seqs, draft_batches, draft_prob_batches):
+            max_tokens = self.block_manager.max_speculative_tokens(seq, self.draft_budget)
+            available = min(len(tokens), max_tokens)
+            truncated_tokens.append(tokens[:available])
+            if available > 0 and probs.dim() >= 2 and probs.size(0) >= available:
+                truncated_probs.append(probs[:available])
+            else:
+                truncated_probs.append(probs.new_empty((0, 0)))
+            total_draft += available
 
-        appended_counts = [0] * len(seqs)
+        if total_draft == 0:
+            self.failure_times += 1
+            token_ids = self.gpu_model.run(seqs, False)
+            return token_ids, 0, False
+
+        base_lengths = [len(seq) for seq in seqs]
+        base_cached = [seq.num_cached_tokens for seq in seqs]
 
         for idx, seq in enumerate(seqs):
-            tokens = draft_batches[idx]
-            if not tokens:
-                continue
-            for token in tokens:
+            for token in truncated_tokens[idx]:
+                if seq.block_table:
+                    self.block_manager.may_append(seq)
                 seq.append_token(token)
-                appended_counts[idx] += 1
-                block_manager.may_append(seq)
-            seq.num_cached_tokens = sequence_snapshots[idx]["num_cached_tokens"]
+            seq.num_cached_tokens = base_cached[idx]
 
-        _, logits = self.gpu_model.run_with_logits(seqs, True)
-        if logits is None:
-            logits = torch.empty((0, 0))
+        with torch.inference_mode():
+            _, logits = self.gpu_model.run_with_logits(seqs, is_prefill=True)
 
-        accepted_counts = [0] * len(seqs)
-        fallback_tokens: List[int | None] = [None] * len(seqs)
+        # for idx, seq in enumerate(seqs):
+        #     self.block_manager.rollback(seq, base_lengths[idx])
+        #     seq.num_cached_tokens = base_cached[idx]
 
         offset = 0
-        with torch.no_grad():
-            for idx, seq in enumerate(seqs):
-                count = appended_counts[idx]
-                tokens = draft_batches[idx]
-                draft_probs = draft_prob_batches[idx] if idx < len(draft_prob_batches) else None
-                if count == 0:
-                    continue
-                seq_logits = logits[offset:offset + count]
-                offset += seq_logits.size(0)
-                temperature = max(seq.temperature, 1e-6)
-                for step_idx, token in enumerate(tokens):
-                    if step_idx >= seq_logits.size(0):
-                        break
-                    gpu_logits = seq_logits[step_idx] / temperature
-                    gpu_probs = torch.softmax(gpu_logits, dim=-1)
-
-                    if (
-                        draft_probs is None
-                        or draft_probs.numel() == 0
-                        or step_idx >= draft_probs.size(0)
-                    ):
-                        draft_probs_step = torch.zeros_like(gpu_probs)
-                    else:
-                        draft_probs_step = draft_probs[step_idx]
-                        if draft_probs_step.device != gpu_probs.device:
-                            draft_probs_step = draft_probs_step.to(gpu_probs.device)
-                        if draft_probs_step.dtype != gpu_probs.dtype:
-                            draft_probs_step = draft_probs_step.to(gpu_probs.dtype)
-
-                    token_prob_gpu_val = float(gpu_probs[token].item())
-                    token_prob_draft_val = float(draft_probs_step[token].item()) if draft_probs_step.numel() else 0.0
-
-                    accept_token = False
-                    if token_prob_gpu_val >= token_prob_draft_val or token_prob_draft_val <= 0.0:
-                        accept_token = True
-                    else:
-                        ratio = token_prob_gpu_val / token_prob_draft_val
-                        ratio = min(ratio, 1.0)
-                        u = torch.rand(1, device=gpu_probs.device).item()
-                        if u <= ratio:
-                            accept_token = True
-
-                    if accept_token:
-                        accepted_counts[idx] += 1
-                        continue
-
-                    diff_probs = (gpu_probs - draft_probs_step).clamp_min(0)
-                    diff_sum = diff_probs.sum()
-                    if diff_sum <= 0:
-                        fallback = int(torch.multinomial(gpu_probs, 1).item())
-                    else:
-                        fallback = int(torch.multinomial(diff_probs / diff_sum, 1).item())
-                    fallback_tokens[idx] = fallback
-                    break
-
-        for seq, snapshot in zip(seqs, sequence_snapshots):
-            seq.token_ids = list(snapshot["token_ids"])
-            seq.num_tokens = snapshot["num_tokens"]
-            seq.last_token = snapshot["last_token"]
-            seq.block_table = list(snapshot["block_table"])
-            seq.num_cached_tokens = snapshot["num_cached_tokens"]
-            seq.status = snapshot["status"]
-
-        block_manager.free_block_ids = block_manager.free_block_ids.__class__(block_snapshot["free_block_ids"])
-        block_manager.used_block_ids = set(block_snapshot["used_block_ids"])
-        block_manager.hash_to_block_id = dict(block_snapshot["hash_to_block_id"])
-        for blk, (ref_count, blk_hash, token_ids) in zip(block_manager.blocks, block_snapshot["blocks"]):
-            blk.ref_count = ref_count
-            blk.hash = blk_hash
-            blk.token_ids = list(token_ids)
-
-        commit_records: list[tuple[Sequence, int]] = []
-        last_gpu_tokens: List[int] = [snapshot["last_token"] for snapshot in sequence_snapshots]
-        any_mismatch = False
+        any_reject = False
 
         for idx, seq in enumerate(seqs):
-            tokens = draft_batches[idx]
-            accepted = accepted_counts[idx]
-            fallback = fallback_tokens[idx]
+            draft_tokens = truncated_tokens[idx]
+            draft_probs = truncated_probs[idx]
+            temperature = max(seq.temperature, 1e-6)
+            pref_len = len(draft_tokens) + 1
+            seq_logits = logits[offset:offset + pref_len]
+            offset += pref_len
 
-            for step_idx in range(accepted):
-                token = tokens[step_idx]
-                commit_records.append((seq, token))
-                last_gpu_tokens[idx] = token
+            verify_logits = seq_logits[:-1] if draft_tokens else seq_logits.new_empty((0, seq_logits.size(-1)))
+            next_logits = seq_logits[-1]
 
-            if accepted < len(tokens):
-                any_mismatch = True
-                if fallback is not None:
-                    commit_records.append((seq, fallback))
-                    last_gpu_tokens[idx] = fallback
+            accepted_steps = 0
+            rejected = False
+            terminated = False
+            base_completion = base_lengths[idx] - seq.num_prompt_tokens
 
-        if commit_records:
-            seq_batch, token_batch = zip(*commit_records)
-            seq_batch = list(seq_batch)
-            token_batch = list(token_batch)
-            for seq, token in zip(seq_batch, token_batch):
-                self.scheduler.postprocess([seq], [token])
-                seq.num_cached_tokens = max(seq.num_tokens-1,0)
-                if not seq.is_finished:
-                    self.scheduler.block_manager.may_append(seq)
+            for step_idx, token in enumerate(draft_tokens):
+                logits_step = verify_logits[step_idx] / temperature
+                p = torch.softmax(logits_step, dim=-1)
+                if draft_probs.numel() == 0:
+                    q = torch.zeros_like(p).fill_(1.0 / p.size(-1))
+                else:
+                    q = draft_probs[step_idx].to(p.device, dtype=p.dtype).clamp_min_(1e-9)
+                token_prob_p = p[token].clamp_min(1e-9)
+                token_prob_q = q[token].clamp_min(1e-9)
+                accept_prob = torch.clamp(token_prob_p / token_prob_q, max=1.0)
+                if torch.rand((), device=p.device) <= accept_prob:
+                    accepted_steps += 1
+                    completion_tokens = base_completion + accepted_steps
+                    if (not seq.ignore_eos and token == self.scheduler.eos) or completion_tokens >= seq.max_tokens:
+                        keep_len = base_lengths[idx] + accepted_steps
+                        self.block_manager.rollback(seq, keep_len)
+                        terminated = True
+                        break
+                    continue
 
-        committed = len(commit_records)
+                residual = (p - q).clamp_min_(0.0)
+                residual_sum = residual.sum()
+                if residual_sum <= 0:
+                    residual = p
+                    residual_sum = residual.sum()
+                residual = residual / residual_sum
+                new_token = int(torch.multinomial(residual, 1).item())
 
-        if any_mismatch:
+                target_len = base_lengths[idx] + accepted_steps
+                self.block_manager.rollback(seq, target_len)
+                if seq.block_table:
+                    self.block_manager.may_append(seq)
+                seq.append_token(new_token)
+                accepted_steps += 1
+                rejected = True
+                any_reject = True
+                break
+
+            if not rejected and not terminated:
+                temperature_tensor = torch.tensor([temperature], dtype=next_logits.dtype, device=next_logits.device)
+                next_token = int(self.gpu_model.sampler(next_logits.unsqueeze(0), temperature_tensor).item())
+                if seq.block_table:
+                    self.block_manager.may_append(seq)
+                seq.append_token(next_token)
+
+        committed = 0
+        for idx, seq in enumerate(seqs):
+            start = base_lengths[idx]
+            new_tokens_count = max(len(seq) - start, 0)
+            finished = False
+            base_completion = base_lengths[idx] - seq.num_prompt_tokens
+            for rel_idx in range(new_tokens_count):
+                token = seq.token_ids[start + rel_idx]
+                completion_tokens = base_completion + rel_idx + 1
+                if (not seq.ignore_eos and token == self.scheduler.eos) or completion_tokens >= seq.max_tokens:
+                    finish_len = start + rel_idx + 1
+                    del seq.token_ids[finish_len:]
+                    seq.num_tokens = finish_len
+                    seq.last_token = seq.token_ids[-1] if seq.token_ids else seq.last_token
+                    new_tokens_count = finish_len - start
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    if seq in self.scheduler.running:
+                        self.scheduler.running.remove(seq)
+                    finished = True
+                    break
+            committed += new_tokens_count
+            if not finished:
+                seq.num_cached_tokens = max(len(seq) - 1, 0)
+
+        if any_reject:
             self.failure_times += 1
         else:
             self.failure_times = 0
 
-        return last_gpu_tokens, committed, True
+        return [], committed, True

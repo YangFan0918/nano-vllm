@@ -68,12 +68,27 @@ class LLMEngine:
             self.scheduler.postprocess(seqs, token_ids)
             if is_prefill:
                 for seq in seqs:
+                    old_cached = seq.num_cached_tokens
                     cached = max(len(seq) - 1, 0)
+                    if old_cached >= len(seq):
+                        import logging
+                        logging.warning(
+                            "prefill: seq=%d had invalid num_cached=%d >= len=%d, fixing to %d",
+                            seq.seq_id, old_cached, len(seq), cached
+                        )
                     seq.num_cached_tokens = cached
             else:
                 committed = len(token_ids) if token_ids is not None else len(seqs)
                 for seq in seqs:
-                    seq.num_cached_tokens = max(len(seq) - 1, 0)
+                    old_cached = seq.num_cached_tokens
+                    cached = max(len(seq) - 1, 0)
+                    if old_cached >= len(seq):
+                        import logging
+                        logging.warning(
+                            "decode: seq=%d had invalid num_cached=%d >= len=%d, fixing to %d",
+                            seq.seq_id, old_cached, len(seq), cached
+                        )
+                    seq.num_cached_tokens = cached
 
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
 

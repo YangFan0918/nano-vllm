@@ -46,6 +46,14 @@ class SpeculativeExecutor:
         if not seqs:
             return [], 0, True
 
+        # Log initial state
+        for seq in seqs:
+            if seq.num_cached_tokens >= len(seq):
+                self.logger.error(
+                    "ENTRY STATE INVALID: seq=%d cached=%d >= len=%d",
+                    seq.seq_id, seq.num_cached_tokens, len(seq)
+                )
+
         cpu_output: RunnerOutput = self.cpu_model.run(seqs, False)
         assert cpu_output.token_ids is not None
         draft_batches = list(cpu_output.token_ids)
@@ -79,6 +87,14 @@ class SpeculativeExecutor:
 
         base_lengths = [len(seq) for seq in seqs]
         base_cached = [seq.num_cached_tokens for seq in seqs]
+        
+        # Log potential problematic states
+        for idx, seq in enumerate(seqs):
+            if seq.num_cached_tokens >= len(seq):
+                self.logger.warning(
+                    "seq=%d BEFORE append: cached=%d >= len=%d, draft_tokens=%d",
+                    seq.seq_id, seq.num_cached_tokens, len(seq), len(truncated_tokens[idx])
+                )
 
         for idx, seq in enumerate(seqs):
             for token in truncated_tokens[idx]:
@@ -111,6 +127,18 @@ class SpeculativeExecutor:
             pref_len = len(draft_tokens) + 1
             seq_logits = logits[offset:offset + pref_len]
             offset += pref_len
+            
+            # Sanity check: should never happen if num_cached_tokens < len(seq) invariant is maintained
+            if seq_logits.numel() == 0:
+                self.logger.error(
+                    "IMPOSSIBLE: Empty logits for seq=%d (len=%d, cached=%d, base_len=%d, draft=%d). "
+                    "This indicates num_cached_tokens invariant was violated!",
+                    seq.seq_id, len(seq), seq.num_cached_tokens, base_lengths[idx], len(draft_tokens)
+                )
+                # Emergency fallback: rollback and skip this sequence
+                self.block_manager.rollback(seq, base_lengths[idx])
+                seq.num_cached_tokens = base_cached[idx]
+                continue
 
             verify_logits = seq_logits[:-1] if draft_tokens else seq_logits.new_empty((0, seq_logits.size(-1)))
             next_logits = seq_logits[-1]

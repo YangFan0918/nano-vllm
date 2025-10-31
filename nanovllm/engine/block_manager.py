@@ -80,6 +80,15 @@ class BlockManager:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
+        
+        # Ensure num_cached_tokens never equals or exceeds sequence length
+        if seq.num_cached_tokens >= len(seq):
+            import logging
+            logging.warning(
+                "allocate: seq=%d has num_cached=%d >= len=%d, capping to len-1",
+                seq.seq_id, seq.num_cached_tokens, len(seq)
+            )
+            seq.num_cached_tokens = max(len(seq) - 1, 0)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):

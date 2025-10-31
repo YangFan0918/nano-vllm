@@ -122,7 +122,7 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_prefill(self, seqs: list[Sequence],tail_only: bool = False):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -143,13 +143,20 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+            if tail_only:
+                for token_idx in range(seq.num_cached_tokens, seqlen):
+                    block_idx = token_idx // self.block_size
+                    block = seq.block_table[block_idx]
+                    slot_offset = token_idx % self.block_size
+                    slot_mapping.append(block * self.block_size + slot_offset)
+            else:
+                for i in range(seq.num_cached_blocks, seq.num_blocks):
+                    start = seq.block_table[i] * self.block_size
+                    if i != seq.num_blocks - 1:
+                        end = start + self.block_size
+                    else:
+                        end = start + seq.last_block_num_tokens
+                    slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -213,7 +220,7 @@ class ModelRunner:
         return token_ids
     
     def run_with_logits(self, seqs: list[Sequence], is_prefill: bool):
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        input_ids, positions = self.prepare_prefill(seqs,tail_only = True) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None

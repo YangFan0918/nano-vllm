@@ -1,5 +1,4 @@
 import logging
-from pathlib import Path
 from typing import List, Tuple
 import torch
 
@@ -25,19 +24,7 @@ class SpeculativeExecutor:
         self.speculative_max_retries = config.speculative_max_retries
         self.draft_budget = config.draft_num_tokens
         self.block_manager = self.scheduler.block_manager
-        self.logger = logging.getLogger("nanovllm.speculative")
-        if not self.logger.handlers:
-            log_dir = Path("logs")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            handler = logging.FileHandler(log_dir / "speculative.log")
-            formatter = logging.Formatter(
-                fmt="%(asctime)s [%(levelname)s] %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
-        self.logger.propagate = False
+        self.logger = logging.getLogger(__name__)
 
     def can_step(self) -> bool:
         return self.failure_times <= self.speculative_max_retries
@@ -241,17 +228,6 @@ class SpeculativeExecutor:
                 produced_token = next_token
 
             total_accepted_draft += accepted_draft
-            if self.logger.isEnabledFor(logging.INFO):
-                self.logger.info(
-                    "seq=%d draft=%d truncated=%d accepted=%d rejected=%s terminated=%s new_token=%s",
-                    seq.seq_id,
-                    original_draft_len,
-                    truncated_len,
-                    accepted_draft,
-                    rejected,
-                    terminated,
-                    produced_token if produced_token is not None else "-",
-                )
 
         committed = 0
         for idx, seq in enumerate(seqs):
@@ -283,15 +259,6 @@ class SpeculativeExecutor:
         else:
             self.failure_times = 0
 
-        if self.logger.isEnabledFor(logging.INFO):
-            self.logger.info(
-                "batch committed=%d original_draft=%d truncated=%d accepted=%d any_reject=%s failure_times=%d",
-                committed,
-                total_original_tokens,
-                total_truncated_tokens,
-                total_accepted_draft,
-                any_reject,
-                self.failure_times,
-            )
+        # Keep errors only; remove per-step/batch info logs to reduce noise
 
         return [], committed, True

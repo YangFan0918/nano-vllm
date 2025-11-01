@@ -122,7 +122,7 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence],tail_only: bool = False):
+    def prepare_prefill(self, seqs: list[Sequence], tail_only: bool = False, prefill_all_logits: bool = False):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -164,7 +164,17 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            prefill_all_logits=prefill_all_logits,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -220,10 +230,15 @@ class ModelRunner:
         return token_ids
     
     def run_with_logits(self, seqs: list[Sequence], is_prefill: bool):
-        input_ids, positions = self.prepare_prefill(seqs,tail_only = True) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        input_ids, positions = (
+            self.prepare_prefill(seqs, tail_only=True, prefill_all_logits=True)
+            if is_prefill
+            else self.prepare_decode(seqs)
+        )
+        # We don't sample in run_with_logits to avoid shape mismatch when returning all prefill logits
+        temperatures = None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = None
         reset_context()
         return token_ids,logits
 

@@ -106,11 +106,29 @@ class SpeculativeExecutor:
         with torch.inference_mode():
             _, logits = self.gpu_model.run_with_logits(seqs, is_prefill=True)
 
+        # Validate logits rows equal total prefill query tokens
+        seq_q_lens = [len(seq) - base_cached[i] for i, seq in enumerate(seqs)]
+        expected_total = sum(max(ql, 0) for ql in seq_q_lens)
+        actual_total = int(logits.size(0)) if hasattr(logits, "size") else -1
+        if actual_total != expected_total:
+            self.logger.error(
+                "PREFILL LOGITS LEN MISMATCH: actual=%d expected=%d | %s",
+                actual_total,
+                expected_total,
+                "; ".join(
+                    f"seq={seq.seq_id} len={len(seq)} cached={base_cached[i]} draft={len(tr)} q_len={seq_q_lens[i]}"
+                    for i, (seq, tr) in enumerate(zip(seqs, truncated_tokens))
+                ),
+            )
+            # Fallback to regular decode for the whole batch this round to avoid crash
+            token_ids = self.gpu_model.run(seqs, False)
+            return token_ids, 0, False
+
         # for idx, seq in enumerate(seqs):
         #     self.block_manager.rollback(seq, base_lengths[idx])
         #     seq.num_cached_tokens = base_cached[idx]
 
-        offset = 0
+        pos = 0
         any_reject = False
         total_original_tokens = 0
         total_truncated_tokens = 0
@@ -124,9 +142,33 @@ class SpeculativeExecutor:
             total_original_tokens += original_draft_len
             total_truncated_tokens += truncated_len
             temperature = max(seq.temperature, 1e-6)
-            pref_len = len(draft_tokens) + 1
-            seq_logits = logits[offset:offset + pref_len]
-            offset += pref_len
+            q_len = seq_q_lens[idx]
+            if q_len <= 0:
+                self.logger.error(
+                    "EMPTY Q LEN: seq=%d len=%d cached=%d draft=%d",
+                    seq.seq_id, len(seq), base_cached[idx], truncated_len,
+                )
+                self.block_manager.rollback(seq, base_lengths[idx])
+                seq.num_cached_tokens = base_cached[idx]
+                pos += max(q_len, 0)
+                continue
+            if truncated_len == 0:
+                seq_logits = logits[pos + q_len - 1: pos + q_len]
+            else:
+                need = truncated_len + 1
+                if q_len < need:
+                    self.logger.error(
+                        "INSUFFICIENT LOGITS: seq=%d q_len=%d need=%d len=%d cached=%d draft=%d",
+                        seq.seq_id, q_len, need, len(seq), base_cached[idx], truncated_len,
+                    )
+                    self.block_manager.rollback(seq, base_lengths[idx])
+                    seq.num_cached_tokens = base_cached[idx]
+                    pos += q_len
+                    continue
+                start = pos + q_len - need
+                end = pos + q_len
+                seq_logits = logits[start:end]
+            pos += q_len
             
             # Sanity check: should never happen if num_cached_tokens < len(seq) invariant is maintained
             if seq_logits.numel() == 0:
@@ -140,7 +182,7 @@ class SpeculativeExecutor:
                 seq.num_cached_tokens = base_cached[idx]
                 continue
 
-            verify_logits = seq_logits[:-1] if draft_tokens else seq_logits.new_empty((0, seq_logits.size(-1)))
+            verify_logits = seq_logits[:-1] if truncated_len > 0 else seq_logits.new_empty((0, seq_logits.size(-1)))
             next_logits = seq_logits[-1]
 
             accepted_steps = 0

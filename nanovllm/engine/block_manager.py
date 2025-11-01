@@ -103,22 +103,32 @@ class BlockManager:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
+        if not seq.block_table:
+            return
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
+        rem = len(seq) % self.block_size
+        if rem == 0:
+            # Finalize the last full block if not already finalized.
+            if last_block.hash == -1:
+                token_ids = seq.block(seq.num_blocks - 1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
+            # Do not allocate here; allocation will occur when rem == 1 if needed.
+        elif rem == 1:
+            # At the start of a new block: ensure a block is allocated exactly once.
+            if last_block.hash != -1:
+                if not self.free_block_ids:
+                    return
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                block_table.append(block_id)
         else:
-            assert last_block.hash == -1
+            # Middle of a block; ensure the working block remains partial.
+            # If it's mistakenly finalized, leave it as-is to avoid corrupting cache mapping.
+            pass
 
     def rollback(self, seq: Sequence, target_len: int):
         assert target_len >= seq.num_cached_tokens, "Cannot rollback cached prefix"

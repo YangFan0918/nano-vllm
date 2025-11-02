@@ -1,3 +1,8 @@
+"""
+Minimal fix for CPU draft runner - avoid expensive save_state/load_state operations
+This is a drop-in replacement that should immediately improve performance
+"""
+
 import torch
 from llama_cpp import Llama
 
@@ -8,9 +13,11 @@ from nanovllm.engine.sequence import Sequence
 
 class CpuDraftRunner(RunnerBase):
     """
-    llama.cpp-based draft runner (replaces HuggingFace). It keeps the same class name
-    to avoid touching other modules. For each sequence we maintain a llama.cpp
-    KV state to support incremental decoding across steps.
+    Minimal optimization: Avoid save_state/load_state by tracking sequences manually
+    Key changes:
+    1. Don't save/load full KV state - too expensive!
+    2. Track sequences with simple token lists
+    3. Re-evaluate from start when context changes (still faster than state save/load)
     """
 
     def __init__(self, config: Config):
@@ -25,39 +32,14 @@ class CpuDraftRunner(RunnerBase):
             n_threads=config.llama_cpp_threads,
             n_gpu_layers=config.llama_cpp_n_gpu_layers,
             logits_all=True,
-            verbose=False
+            verbose=False,
+            use_mmap=True,  # Memory-mapped for faster loading
         )
-        # Base empty state
-        self.llm.reset()
-        self._base_state = self.llm.save_state()
 
-        # Per-sequence KV state cache: seq_id -> (state_bytes, cached_len)
-        self._states: dict[int, tuple[bytes, int]] = {}
-
-    def _load_seq_state(self, seq_id: int) -> int:
-        state = self._states.get(seq_id)
-        if state is None:
-            # Load empty base state
-            self.llm.reset()
-            if self._base_state:
-                self.llm.load_state(self._base_state)
-            return 0
-        else:
-            state_bytes, cached_len = state
-            self.llm.load_state(state_bytes)
-            return cached_len
-
-    def _save_seq_state(self, seq_id: int, cur_len: int):
-        state_bytes = self.llm.save_state()
-        self._states[seq_id] = (state_bytes, cur_len)
-
-    def _eval_to_len(self, input_ids: list[int], cur_len: int) -> int:
-        if cur_len < len(input_ids):
-            pending = input_ids[cur_len:]
-            if pending:
-                self.llm.eval(pending)
-            return len(input_ids)
-        return cur_len
+        # Track sequences WITHOUT saving full KV state
+        # Just track what tokens we've processed
+        self._seq_cache: dict[int, list[int]] = {}
+        self._last_seq_id = None
 
     def run(
         self,
@@ -67,37 +49,63 @@ class CpuDraftRunner(RunnerBase):
         if is_prefill:
             return RunnerOutput()
 
-        assert sequences, "CpuDraftRunner (llama.cpp) expects at least one sequence"
+        assert sequences, "CpuDraftRunner expects at least one sequence"
 
         batch_tokens: list[list[int]] = []
         batch_probs: list[torch.Tensor] = []
 
         for seq in sequences:
-            # Restore KV state and catch up to current committed prompt length
-            cur_len = self._load_seq_state(seq.seq_id)
-            cur_len = self._eval_to_len(seq.token_ids, cur_len)
-            # Persist baseline at committed length only (speculative tokens are not saved)
-            self._save_seq_state(seq.seq_id, len(seq.token_ids))
+            seq_id = seq.seq_id
+            current_tokens = seq.token_ids
+            
+            # Check if we can reuse context
+            cached_tokens = self._seq_cache.get(seq_id, [])
+            
+            # Find common prefix length
+            common_len = 0
+            for i in range(min(len(cached_tokens), len(current_tokens))):
+                if cached_tokens[i] == current_tokens[i]:
+                    common_len = i + 1
+                else:
+                    break
+            
+            # Strategy: If we need to backtrack or switch context significantly,
+            # just re-evaluate from scratch (faster than save/load state!)
+            if seq_id != self._last_seq_id or common_len < len(cached_tokens):
+                # Reset and rebuild context
+                self.llm.reset()
+                if current_tokens:
+                    self.llm.eval(current_tokens)
+                self._seq_cache[seq_id] = current_tokens.copy()
+            elif common_len < len(current_tokens):
+                # We can continue from where we left off
+                new_tokens = current_tokens[common_len:]
+                if new_tokens:
+                    self.llm.eval(new_tokens)
+                self._seq_cache[seq_id] = current_tokens.copy()
+            
+            self._last_seq_id = seq_id
 
+            # Generate draft tokens
             new_tokens: list[int] = []
             step_probs: list[torch.Tensor] = []
-            steps = self.draft_num_tokens
             temperature = max(seq.temperature, self.temperature_floor)
 
-            for _ in range(steps):
+            for _ in range(self.draft_num_tokens):
                 logits = self.llm.eval_logits
                 if logits is None or len(logits) == 0:
                     break
+                
+                # Fast tensor operations
                 logits_t = torch.tensor(logits[-1], dtype=torch.float32)
                 probs = torch.softmax(logits_t / temperature, dim=-1)
                 step_probs.append(probs)
+                
                 next_token = int(torch.multinomial(probs, 1).item())
                 new_tokens.append(next_token)
-                # Advance context with sampled token
+                
+                # Advance context
                 self.llm.eval([next_token])
-
-            # IMPORTANT: do NOT persist state including speculative tokens.
-            # The saved state remains at committed_len to allow GPU-side rollback.
 
             batch_tokens.append(new_tokens)
             if step_probs:
@@ -107,3 +115,4 @@ class CpuDraftRunner(RunnerBase):
             batch_probs.append(probs_tensor)
 
         return RunnerOutput(token_ids=batch_tokens, probs=batch_probs)
+

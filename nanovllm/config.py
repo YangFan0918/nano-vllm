@@ -23,6 +23,10 @@ class Config:
     draft_workers: int = 1
     speculative_max_retries: int = 2
     def __post_init__(self):
+    # llama.cpp specific (for draft runner)
+        self.llama_cpp_threads: int = 0  # 0 -> auto detect (os.cpu_count())
+        self.llama_cpp_n_ctx: int = 0    # 0 -> use max_model_len
+        self.llama_cpp_n_gpu_layers: int = 0
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
@@ -30,7 +34,17 @@ class Config:
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
         if self.enable_speculative_sampling:
-            assert self.draft_model is not None and os.path.isdir(self.draft_model)
+            # Require GGUF file path for llama.cpp draft model
+            assert self.draft_model is not None, "draft_model must be provided when speculative sampling is enabled"
+            assert os.path.isfile(self.draft_model), "draft_model must be a GGUF file path"
+            assert self.draft_model.endswith('.gguf'), "draft_model must be a .gguf file for llama.cpp"
             assert self.draft_num_tokens > 0
             assert self.draft_workers > 0
             assert self.speculative_max_retries >= 0
+            if self.llama_cpp_threads <= 0:
+                self.llama_cpp_threads = os.cpu_count() or 1
+            assert self.llama_cpp_threads > 0
+            if self.llama_cpp_n_ctx <= 0:
+                self.llama_cpp_n_ctx = self.max_model_len
+            assert self.llama_cpp_n_ctx > 0
+            assert self.llama_cpp_n_gpu_layers >= 0

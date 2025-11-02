@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 
 def main():
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    draft_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    draft_path = os.path.expanduser("~/huggingface/Qwen3-0.6B-f16.gguf")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1,enable_speculative_sampling = True,draft_model=draft_path)
 

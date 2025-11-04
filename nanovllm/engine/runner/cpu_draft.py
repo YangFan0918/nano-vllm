@@ -3,6 +3,7 @@ Minimal fix for CPU draft runner - avoid expensive save_state/load_state operati
 This is a drop-in replacement that should immediately improve performance
 """
 
+import os
 import torch
 from llama_cpp import Llama
 
@@ -26,12 +27,20 @@ class CpuDraftRunner(RunnerBase):
         self.temperature_floor = 1e-6
 
         # Initialize llama.cpp
+        # Limit PyTorch CPU thread usage to avoid oversubscription with llama.cpp
+        try:
+            torch.set_num_threads(int(os.getenv("NANOVLLM_TORCH_THREADS", "1")))
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+
         self.llm = Llama(
             model_path=config.draft_model,
             n_ctx=config.llama_cpp_n_ctx,
             n_threads=config.llama_cpp_threads,
             n_gpu_layers=config.llama_cpp_n_gpu_layers,
-            logits_all=True,
+            # Only need last-step logits for iterative generation
+            logits_all=False,
             verbose=False,
             use_mmap=True,  # Memory-mapped for faster loading
         )
@@ -115,4 +124,3 @@ class CpuDraftRunner(RunnerBase):
             batch_probs.append(probs_tensor)
 
         return RunnerOutput(token_ids=batch_tokens, probs=batch_probs)
-

@@ -22,11 +22,11 @@ class Config:
     draft_num_tokens: int = 4
     draft_workers: int = 1
     speculative_max_retries: int = 2
+    # llama.cpp (CPU draft runner) settings
+    llama_cpp_threads: int = 10  # fixed by default per user request
+    llama_cpp_n_ctx: int = 0     # 0 -> use max_model_len
+    llama_cpp_n_gpu_layers: int = 0
     def __post_init__(self):
-    # llama.cpp specific (for draft runner)
-        self.llama_cpp_threads: int = 0  # 0 -> auto detect (os.cpu_count())
-        self.llama_cpp_n_ctx: int = 0    # 0 -> use max_model_len
-        self.llama_cpp_n_gpu_layers: int = 0
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
@@ -42,7 +42,8 @@ class Config:
             assert self.draft_workers > 0
             assert self.speculative_max_retries >= 0
             if self.llama_cpp_threads <= 0:
-                self.llama_cpp_threads = os.cpu_count() or 1
+                # Keep it simple: fixed 10 threads unless explicitly overridden.
+                self.llama_cpp_threads = 10
             assert self.llama_cpp_threads > 0
             if self.llama_cpp_n_ctx <= 0:
                 self.llama_cpp_n_ctx = self.max_model_len

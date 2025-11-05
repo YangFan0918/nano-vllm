@@ -21,7 +21,7 @@ class Config:
     draft_model: str | None = None
     draft_num_tokens: int = 4
     draft_workers: int = 1
-    speculative_max_retries: int = 2
+    speculative_max_retries: int = 10
     # llama.cpp (CPU draft runner) settings
     llama_cpp_threads: int = 10  # fixed by default per user request
     llama_cpp_n_ctx: int = 0     # 0 -> use max_model_len
@@ -41,6 +41,13 @@ class Config:
             assert self.draft_num_tokens > 0
             assert self.draft_workers > 0
             assert self.speculative_max_retries >= 0
+            # Optional env override for llama.cpp thread count
+            env_llama_threads = os.getenv("NANOVLLM_LLAMA_CPP_THREADS")
+            if env_llama_threads is not None:
+                try:
+                    self.llama_cpp_threads = int(env_llama_threads)
+                except Exception:
+                    pass
             if self.llama_cpp_threads <= 0:
                 # Keep it simple: fixed 10 threads unless explicitly overridden.
                 self.llama_cpp_threads = 10
